@@ -1,0 +1,6 @@
+# Trusted IP-to-MAC bindings (lab stand-in for a DHCP snooping database).
+# Format:  IP  MAC
+# Use addresses from YOUR isolated classroom network only.
+#
+# 192.168.56.1   0a:00:27:00:00:01
+# 192.168.56.10  aa:bb:cc:dd:ee:ff
