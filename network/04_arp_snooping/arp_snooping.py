@@ -1,34 +1,53 @@
 """
-ARP snooping / Dynamic ARP Inspection — classroom lab.
+ARP snooping lab — classroom interactive shell.
 
-Discovery is not rewritten here. This lab imports scan() and show_result()
-from network/02_network_discovery/network_scanner.py, then the student
-picks one IP from that table and we watch ARP for it.
+If the student forgets -i, ifconfig is used to list adapters:
 
-This does not forge ARP replies or change anyone's cache. Lab network only.
+  1) eth0 lan (default)
+  2) wlan0 wifi
+
+After an adapter is chosen it is put in monitor mode (wifi only).
+Then the student types net.show to list hosts (02_network_discovery),
+then a number or IP to start ARP inspection.
+
+This does not forge ARP replies. Lab network only.
 """
 
 from __future__ import annotations
 
 import argparse
+import atexit
 import os
 import sys
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_DISCOVERY_DIR = os.path.abspath(os.path.join(_THIS_DIR, "..", "02_network_discovery"))
-if _DISCOVERY_DIR not in sys.path:
-    # 02_network_discovery is not a valid Python package name (starts with a digit),
-    # so we add that folder to sys.path and import network_scanner as a module.
-    sys.path.insert(0, _DISCOVERY_DIR)
+_NETWORK_DIR = os.path.abspath(os.path.join(_THIS_DIR, ".."))
+for _lab in ("02_network_discovery", "03_convert_to_monitor_mode"):
+    _path = os.path.join(_NETWORK_DIR, _lab)
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 try:
-    from network_scanner import scan, show_result
+    from network_scanner import local_cidr, scan, show_result
 except ImportError as err:
     print("Could not import network_scanner.py from network/02_network_discovery/")
     print(err)
     print("If Scapy is missing, from the repo root run:  pip install -r requirements.txt")
+    sys.exit(1)
+
+try:
+    from monitor_mode import (
+        current_mode,
+        is_wireless,
+        pick_interface,
+        set_managed,
+        set_monitor,
+    )
+except ImportError as err:
+    print("Could not import monitor_mode.py from network/03_convert_to_monitor_mode/")
+    print(err)
     sys.exit(1)
 
 try:
@@ -39,26 +58,6 @@ except ImportError:
 
 
 ARP_OP = {1: "REQUEST", 2: "REPLY"}
-
-
-def ask_for_target(hosts):
-    """Student types a table number (1, 2, ...) or the IP itself."""
-    while True:
-        choice = input("\nEnter the number or IP to watch (or q to quit): ").strip()
-        if choice.lower() in {"q", "quit", "exit"}:
-            return None
-
-        if choice.isdigit():
-            index = int(choice)
-            if 1 <= index <= len(hosts):
-                return hosts[index - 1]
-            print(f"Pick a number between 1 and {len(hosts)}.")
-            continue
-
-        for host in hosts:
-            if host["ip"] == choice:
-                return host
-        print("That IP is not in the discovery table. Choose a listed host.")
 
 
 class Binding:
@@ -139,89 +138,131 @@ def handle_packet(pkt, inspector, verbose):
         )
 
 
-def list_interfaces():
-    print("Available interfaces (pass one to -i / --iface):\n")
-    print(f"  default: {scapy.conf.iface}")
-    for name in scapy.get_if_list():
-        marker = "  (default)" if str(name) == str(scapy.conf.iface) else ""
-        print(f"  {name}{marker}")
+class AdapterSession:
+    """Put a wireless NIC in monitor mode, always try to restore managed on exit."""
+
+    def __init__(self, iface):
+        self.iface = iface
+        self.wireless = is_wireless(iface)
+        self.original_mode = current_mode(iface) if self.wireless else "managed"
+        self.changed = False
+
+    def restore(self):
+        if not self.changed:
+            return
+        print(f"\nRestoring {self.iface} to managed mode ...")
+        set_managed(self.iface)
+        self.changed = False
+
+    def enable_monitor(self):
+        if not self.wireless:
+            print(
+                f"{self.iface} is not wireless; skipping monitor mode "
+                "(typical for VMware/VirtualBox Ethernet)."
+            )
+            return False
+        print(f"Switching {self.iface} to monitor mode (was {self.original_mode}) ...")
+        ok = set_monitor(self.iface)
+        self.changed = True
+        if not ok:
+            print("Monitor mode failed; continuing in the current mode.")
+        return ok
+
+    def ensure_managed_for_scan(self):
+        if not self.wireless:
+            return
+        mode = current_mode(self.iface)
+        if mode == "monitor":
+            print("Temporarily switching to managed so net.show / ARP discovery can work ...")
+            set_managed(self.iface)
+            self.changed = True
 
 
-def parse_args(argv: Optional[list] = None):
-    parser = argparse.ArgumentParser(
-        description="Import network_scanner, pick an IP, then watch that IP's ARP binding (lab only)."
+def print_help():
+    print(
+        "\nCommands:\n"
+        "  net.show     list devices on the network (uses network discovery)\n"
+        "  <number>     start ARP snooping on that row from net.show\n"
+        "  <ip>         start ARP snooping on that IP from net.show\n"
+        "  help         show this list\n"
+        "  exit         restore managed mode and quit\n"
     )
-    parser.add_argument(
-        "-t",
-        "--target",
-        default="192.168.18.1/24",
-        help="Subnet to discover (same default as network_scanner.py)",
-    )
-    parser.add_argument("-i", "--iface", help="Network interface")
-    parser.add_argument(
-        "--ip",
-        dest="selected_ip",
-        help="Skip the prompt and watch this IP (must answer the scan)",
-    )
-    parser.add_argument(
-        "-c",
-        "--count",
-        type=int,
-        default=0,
-        help="Stop after N matching ARP packets (0 = until Ctrl+C)",
-    )
-    parser.add_argument("--list-ifaces", action="store_true", help="Print interface names and exit")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Print every watched ARP packet")
-    return parser.parse_args(argv)
 
 
-def main(argv: Optional[list] = None) -> int:
-    args = parse_args(argv)
+def resolve_host(hosts, choice):
+    if choice.isdigit():
+        index = int(choice)
+        if 1 <= index <= len(hosts):
+            return hosts[index - 1]
+        print(f"Pick a number between 1 and {len(hosts)} (run net.show first).")
+        return False
+    for host in hosts:
+        if host["ip"] == choice:
+            return host
+    print("That IP is not in the last net.show table. Run net.show again.")
+    return False
 
-    if args.list_ifaces:
-        list_interfaces()
-        return 0
 
-    # Discovery uses the previous lab as a module (scan + show_result).
-    if args.iface:
-        scapy.conf.iface = args.iface
+def interactive_shell(session, iface, target, verbose, lesson):
+    hosts = []
+    print_help()
+    print(f"Adapter {iface} is ready. Type net.show then pick an IP.")
 
-    print(f"Discovering hosts on {args.target} ...")
-    hosts = scan(args.target)
-    show_result(hosts, numbered=True)
+    while True:
+        try:
+            raw = input("arp> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
 
-    if not hosts:
-        print("No replies. Check the subnet, interface, and that you may scan this lab network.")
-        return 1
+        if not raw:
+            continue
 
-    if args.selected_ip:
-        chosen = next((h for h in hosts if h["ip"] == args.selected_ip), None)
-        if chosen is None:
-            print(f"{args.selected_ip} did not answer the discovery scan.")
-            return 1
-    else:
-        chosen = ask_for_target(hosts)
-        if chosen is None:
-            print("No host selected.")
-            return 0
+        cmd = raw.lower()
+        if cmd in {"exit", "quit", "q"}:
+            return None
+        if cmd in {"help", "?"}:
+            print_help()
+            continue
+        if cmd in {"net.show", "net show", "netshow"}:
+            session.ensure_managed_for_scan()
+            scapy.conf.iface = iface
+            cidr = target or local_cidr(iface) or "192.168.18.0/24"
+            print(f"\nnet.show  ({cidr} on {iface})")
+            hosts = scan(cidr, iface=iface, verbose=lesson)
+            show_result(hosts, numbered=True)
+            if not hosts:
+                print("No replies. Pick the adapter that has the lab IP, then run net.show again.")
+            session.enable_monitor()
+            continue
 
+        if not hosts:
+            print("Run net.show first so you have a device list.")
+            continue
+
+        chosen = resolve_host(hosts, raw)
+        if chosen:
+            return chosen
+
+
+def watch_host(session, iface, chosen, verbose, packet_count):
     print("\nip \t\t\t\t\t mac")
     print(f"{chosen['ip']}\t\t\t\t{chosen['mac']}")
-    print(f"\nWatching ARP for {chosen['ip']} (expected MAC {chosen['mac']}).")
-    print("Ctrl+C to stop.\n")
+    session.enable_monitor()
+    print(f"\nARP snooping on {chosen['ip']} (expected MAC {chosen['mac']}).")
+    print("Ctrl+C to stop (adapter returns to managed mode).\n")
 
     inspector = ArpInspector(watch_ip=chosen["ip"])
     inspector.seed(chosen["ip"], chosen["mac"], source="discovered")
 
     sniff_kwargs = {
-        "filter": f"arp and host {chosen['ip']}",
+        "filter": "arp",
         "store": False,
-        "prn": lambda pkt: handle_packet(pkt, inspector, args.verbose),
+        "prn": lambda pkt: handle_packet(pkt, inspector, verbose),
+        "iface": iface,
     }
-    if args.iface:
-        sniff_kwargs["iface"] = args.iface
-    if args.count > 0:
-        sniff_kwargs["count"] = args.count
+    if packet_count > 0:
+        sniff_kwargs["count"] = packet_count
 
     try:
         scapy.sniff(**sniff_kwargs)
@@ -235,8 +276,53 @@ def main(argv: Optional[list] = None) -> int:
         print(inspector.table_text())
         print(f"\nARP packets seen: {inspector.packets}")
         print(f"Conflicts flagged: {inspector.alerts}")
-
     return 0
+
+
+def parse_args(argv: Optional[list] = None):
+    parser = argparse.ArgumentParser(
+        description="ifconfig adapter menu, net.show, then ARP snooping on the selected IP."
+    )
+    parser.add_argument(
+        "-i",
+        "--iface",
+        "--interface",
+        dest="iface",
+        help="Adapter name from ifconfig (if omitted, the script asks)",
+    )
+    parser.add_argument("-t", "--target", help="Subnet for net.show, e.g. 192.168.18.0/24")
+    parser.add_argument(
+        "-c",
+        "--count",
+        type=int,
+        default=0,
+        help="Stop snooping after N ARP packets (0 = until Ctrl+C)",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Print every watched ARP packet")
+    parser.add_argument("--lesson", action="store_true", help="Extra Scapy dumps during net.show")
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[list] = None) -> int:
+    args = parse_args(argv)
+
+    iface = pick_interface(args.iface)
+    if not iface:
+        print("No adapter selected.")
+        return 0
+
+    session = AdapterSession(iface)
+    atexit.register(session.restore)
+
+    try:
+        session.enable_monitor()
+        chosen = interactive_shell(session, iface, args.target, args.verbose, args.lesson)
+        if chosen is None:
+            print("No host selected.")
+            return 0
+        return watch_host(session, iface, chosen, args.verbose, args.count)
+    finally:
+        session.restore()
 
 
 if __name__ == "__main__":
