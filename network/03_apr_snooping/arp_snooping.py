@@ -1,38 +1,11 @@
 """
-ARP snooping / Dynamic ARP Inspection (DAI) — defensive classroom lab.
+ARP snooping / Dynamic ARP Inspection — classroom lab.
 
-What this program does
-----------------------
-Switches that support ARP snooping (often paired with DHCP snooping) watch
-ARP traffic and keep an IP-to-MAC binding table. Dynamic ARP Inspection then
-compares each ARP packet to that table. A mismatch is treated as suspicious
-because it may be an ARP cache-poisoning attempt.
+Discovery is not rewritten here. This lab imports scan() and show_result()
+from network/02_network_discovery/network_scanner.py, then the student
+picks one IP from that table and we watch ARP for it.
 
-This script is a software version of that idea for teaching:
-
-1. Optionally load a trusted binding file (the lab stand-in for DHCP snooping).
-2. Passively sniff ARP packets on one interface (it does not inject frames).
-3. Record sender IP/MAC pairs in a binding table.
-4. Raise an alert when an IP is claimed by a MAC that is not the trusted one.
-
-What this program does not do
------------------------------
-It does not forge ARP replies, change anyone's ARP cache, intercept traffic,
-or poison DNS. Those are attacks. This lab only inspects and reports.
-
-Classroom setup
----------------
-- Run only on a network you are authorized to monitor (your VM lab is ideal).
-- Windows: install Npcap, then run the terminal as Administrator.
-- Linux/macOS: run with sufficient privileges to sniff (often sudo).
-- Install:  pip install -r requirements.txt
-- List NICs: python defensive/arp_snooping.py --list-ifaces
-- Example:  python defensive/arp_snooping.py -i eth0 --trusted defensive/trusted_bindings.txt --learn
-
-Related lab in this repo
-------------------------
-network/network_scanner.py *sends* ARP requests to discover hosts.
-This file *listens* to ARP and validates bindings. Same protocol, opposite role.
+This does not forge ARP replies or change anyone's cache. Lab network only.
 """
 
 from __future__ import annotations
@@ -43,8 +16,23 @@ import sys
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_DISCOVERY_DIR = os.path.abspath(os.path.join(_THIS_DIR, "..", "02_network_discovery"))
+if _DISCOVERY_DIR not in sys.path:
+    # 02_network_discovery is not a valid Python package name (starts with a digit),
+    # so we add that folder to sys.path and import network_scanner as a module.
+    sys.path.insert(0, _DISCOVERY_DIR)
+
 try:
-    from scapy.all import ARP, conf, get_if_list, sniff
+    from network_scanner import scan, show_result
+except ImportError as err:
+    print("Could not import network_scanner.py from network/02_network_discovery/")
+    print(err)
+    print("If Scapy is missing, from the repo root run:  pip install -r requirements.txt")
+    sys.exit(1)
+
+try:
+    import scapy.all as scapy
 except ImportError:
     print("Scapy is required. From the repo root run:  pip install -r requirements.txt")
     sys.exit(1)
@@ -53,62 +41,60 @@ except ImportError:
 ARP_OP = {1: "REQUEST", 2: "REPLY"}
 
 
-class Binding:
-    """One IP -> MAC mapping learned from a trusted file or from live ARP."""
+def ask_for_target(hosts):
+    """Student types a table number (1, 2, ...) or the IP itself."""
+    while True:
+        choice = input("\nEnter the number or IP to watch (or q to quit): ").strip()
+        if choice.lower() in {"q", "quit", "exit"}:
+            return None
 
-    def __init__(self, ip: str, mac: str, source: str) -> None:
+        if choice.isdigit():
+            index = int(choice)
+            if 1 <= index <= len(hosts):
+                return hosts[index - 1]
+            print(f"Pick a number between 1 and {len(hosts)}.")
+            continue
+
+        for host in hosts:
+            if host["ip"] == choice:
+                return host
+        print("That IP is not in the discovery table. Choose a listed host.")
+
+
+class Binding:
+    def __init__(self, ip, mac, source):
         now = datetime.now(timezone.utc)
         self.ip = ip
         self.mac = mac.lower()
-        self.source = source  # "trusted" or "learned"
+        self.source = source
         self.first_seen = now
         self.last_seen = now
         self.seen = 1
 
-    def touch(self) -> None:
+    def touch(self):
         self.last_seen = datetime.now(timezone.utc)
         self.seen += 1
 
 
 class ArpInspector:
-    """Maintains the binding table and checks each ARP sender claim."""
-
-    def __init__(self, learn: bool) -> None:
-        self.learn = learn
+    def __init__(self, watch_ip):
+        self.watch_ip = watch_ip
         self.bindings: Dict[str, Binding] = {}
         self.alerts = 0
         self.packets = 0
 
-    def load_trusted_file(self, path: str) -> int:
-        loaded = 0
-        with open(path, encoding="utf-8") as handle:
-            for line_no, raw in enumerate(handle, start=1):
-                line = raw.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split()
-                if len(parts) != 2:
-                    print(f"[warn] skip trusted_bindings line {line_no}: expected 'IP MAC'")
-                    continue
-                ip, mac = parts
-                self.bindings[ip] = Binding(ip, mac, source="trusted")
-                loaded += 1
-        return loaded
+    def seed(self, ip, mac, source="discovered"):
+        self.bindings[ip] = Binding(ip, mac, source)
 
-    def inspect_sender(self, ip: str, mac: str, op_name: str) -> str:
-        """
-        Compare the ARP sender (psrc, hwsrc) with the table.
-
-        Returns a short status used in the log line.
-        """
+    def inspect_sender(self, ip, mac, op_name):
         mac = mac.lower()
         existing = self.bindings.get(ip)
 
         if existing is None:
-            if self.learn:
+            if ip == self.watch_ip:
                 self.bindings[ip] = Binding(ip, mac, source="learned")
                 return "LEARNED"
-            return "UNBOUND"
+            return "OTHER"
 
         if existing.mac == mac:
             existing.touch()
@@ -116,38 +102,36 @@ class ArpInspector:
 
         self.alerts += 1
         print(
-            "\n[ALERT] Possible ARP spoofing / poisoning\n"
-            f"        IP {ip} is bound to {existing.mac} ({existing.source})\n"
-            f"        but this {op_name} claims sender MAC {mac}\n"
-            "        Action in a real switch: drop the ARP packet, log, optionally shut the port.\n"
+            "\n[ALERT] Binding conflict for the selected IP\n"
+            f"        IP {ip} was {existing.mac} ({existing.source})\n"
+            f"        this {op_name} claims sender MAC {mac}\n"
+            "        In a switch DAI would drop this ARP and log it.\n"
         )
         return "CONFLICT"
 
-    def table_text(self) -> str:
+    def table_text(self):
         if not self.bindings:
             return "(binding table is empty)"
-        header = f"{'IP':<16} {'MAC':<18} {'SOURCE':<8} {'SEEN':<6} LAST_SEEN_UTC"
-        lines = [header, "-" * len(header)]
+        print_ip_mac = ["ip \t\t\t\t\t mac"]
         for ip in sorted(self.bindings):
             b = self.bindings[ip]
-            last = b.last_seen.strftime("%Y-%m-%d %H:%M:%S")
-            lines.append(f"{b.ip:<16} {b.mac:<18} {b.source:<8} {b.seen:<6} {last}")
-        return "\n".join(lines)
+            print_ip_mac.append(f"{b.ip}\t\t\t\t{b.mac}")
+        return "\n".join(print_ip_mac)
 
 
-def handle_packet(pkt, inspector: ArpInspector, verbose: bool) -> None:
-    if not pkt.haslayer(ARP):
+def handle_packet(pkt, inspector, verbose):
+    if not pkt.haslayer(scapy.ARP):
         return
 
-    arp = pkt[ARP]
+    arp = pkt[scapy.ARP]
+    if inspector.watch_ip not in {arp.psrc, arp.pdst}:
+        return
+
     inspector.packets += 1
     op_name = ARP_OP.get(int(arp.op), str(arp.op))
-
-    # Sender protocol/hardware addresses: "I am IP psrc at MAC hwsrc".
-    # DAI cares most about this claim, because that is what other hosts cache.
     status = inspector.inspect_sender(arp.psrc, arp.hwsrc, op_name)
 
-    if verbose or status in {"CONFLICT", "LEARNED", "UNBOUND"}:
+    if verbose or status in {"CONFLICT", "LEARNED"}:
         ts = datetime.now().strftime("%H:%M:%S")
         print(
             f"[{ts}] ARP {op_name:<7} "
@@ -155,50 +139,39 @@ def handle_packet(pkt, inspector: ArpInspector, verbose: bool) -> None:
         )
 
 
-def list_interfaces() -> None:
+def list_interfaces():
     print("Available interfaces (pass one to -i / --iface):\n")
-    print(f"  default: {conf.iface}")
-    for name in get_if_list():
-        marker = "  (default)" if str(name) == str(conf.iface) else ""
+    print(f"  default: {scapy.conf.iface}")
+    for name in scapy.get_if_list():
+        marker = "  (default)" if str(name) == str(scapy.conf.iface) else ""
         print(f"  {name}{marker}")
 
 
-def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
-    here = os.path.dirname(os.path.abspath(__file__))
-    default_trusted = os.path.join(here, "trusted_bindings.txt")
-
+def parse_args(argv: Optional[list] = None):
     parser = argparse.ArgumentParser(
-        description="Defensive ARP snooping / Dynamic ARP Inspection lab (passive monitor only)."
-    )
-    parser.add_argument("-i", "--iface", help="Network interface to sniff")
-    parser.add_argument(
-        "--trusted",
-        default=default_trusted,
-        help="File of trusted IP MAC pairs (default: defensive/trusted_bindings.txt)",
+        description="Import network_scanner, pick an IP, then watch that IP's ARP binding (lab only)."
     )
     parser.add_argument(
-        "--learn",
-        action="store_true",
-        help="Sticky-learn: the first MAC seen for an unbound IP becomes the binding",
+        "-t",
+        "--target",
+        default="192.168.18.1/24",
+        help="Subnet to discover (same default as network_scanner.py)",
+    )
+    parser.add_argument("-i", "--iface", help="Network interface")
+    parser.add_argument(
+        "--ip",
+        dest="selected_ip",
+        help="Skip the prompt and watch this IP (must answer the scan)",
     )
     parser.add_argument(
         "-c",
         "--count",
         type=int,
         default=0,
-        help="Stop after N ARP packets (0 = until Ctrl+C)",
+        help="Stop after N matching ARP packets (0 = until Ctrl+C)",
     )
-    parser.add_argument(
-        "--list-ifaces",
-        action="store_true",
-        help="Print interface names and exit",
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Print every ARP packet, not only new/unbound/conflict events",
-    )
+    parser.add_argument("--list-ifaces", action="store_true", help="Print interface names and exit")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Print every watched ARP packet")
     return parser.parse_args(argv)
 
 
@@ -209,24 +182,39 @@ def main(argv: Optional[list] = None) -> int:
         list_interfaces()
         return 0
 
-    inspector = ArpInspector(learn=args.learn)
+    # Discovery uses the previous lab as a module (scan + show_result).
+    if args.iface:
+        scapy.conf.iface = args.iface
 
-    if os.path.isfile(args.trusted):
-        n = inspector.load_trusted_file(args.trusted)
-        print(f"Loaded {n} trusted binding(s) from {args.trusted}")
+    print(f"Discovering hosts on {args.target} ...")
+    hosts = scan(args.target)
+    show_result(hosts, numbered=True)
+
+    if not hosts:
+        print("No replies. Check the subnet, interface, and that you may scan this lab network.")
+        return 1
+
+    if args.selected_ip:
+        chosen = next((h for h in hosts if h["ip"] == args.selected_ip), None)
+        if chosen is None:
+            print(f"{args.selected_ip} did not answer the discovery scan.")
+            return 1
     else:
-        print(f"No trusted file at {args.trusted} (continuing with an empty table)")
+        chosen = ask_for_target(hosts)
+        if chosen is None:
+            print("No host selected.")
+            return 0
 
-    if not inspector.bindings and not args.learn:
-        print("Hint: add IP/MAC rows to the trusted file, or pass --learn for sticky lab mode.")
+    print("\nip \t\t\t\t\t mac")
+    print(f"{chosen['ip']}\t\t\t\t{chosen['mac']}")
+    print(f"\nWatching ARP for {chosen['ip']} (expected MAC {chosen['mac']}).")
+    print("Ctrl+C to stop.\n")
 
-    print("Listening for ARP (passive). Ctrl+C to stop and print the binding table.\n")
-    print("Seed table:")
-    print(inspector.table_text())
-    print()
+    inspector = ArpInspector(watch_ip=chosen["ip"])
+    inspector.seed(chosen["ip"], chosen["mac"], source="discovered")
 
     sniff_kwargs = {
-        "filter": "arp",
+        "filter": f"arp and host {chosen['ip']}",
         "store": False,
         "prn": lambda pkt: handle_packet(pkt, inspector, args.verbose),
     }
@@ -236,7 +224,7 @@ def main(argv: Optional[list] = None) -> int:
         sniff_kwargs["count"] = args.count
 
     try:
-        sniff(**sniff_kwargs)
+        scapy.sniff(**sniff_kwargs)
     except PermissionError:
         print("Need administrator/root privileges to sniff ARP on this interface.")
         return 1

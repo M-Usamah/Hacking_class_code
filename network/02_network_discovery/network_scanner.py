@@ -76,8 +76,14 @@ def scan(ip):
     return ls  # send the list back to the caller
 
 
-def show_result(ls_of_results):
+def show_result(ls_of_results, numbered=False):
     # ls_of_results is the list of dictionaries returned by scan()
+    if numbered:
+        print("No\tip \t\t\t\t\t mac")
+        for index, ls in enumerate(ls_of_results, start=1):
+            print(f"{index}\t{ls['ip']}\t\t\t\t{ls['mac']}")
+        return
+
     print("ip \t\t\t\t\t mac")
     for ls in ls_of_results:  # loop over each dictionary in the list
         # ls['ip'] and ls['mac'] read values from the dictionary by key
@@ -89,5 +95,10 @@ def show_result(ls_of_results):
 # 2. Send it with srp() and collect replies
 # 3. Store each live host as a dictionary {"ip": ..., "mac": ...} inside a list
 # 4. Print that list as a simple IP / MAC table
-scan_net = scan("192.168.18.1/24")
-show_result(scan_net)
+#
+# The if __name__ == "__main__" guard means:
+#   python network_scanner.py  -> runs the scan below
+#   import network_scanner     -> only loads scan() and show_result(), no auto-scan
+if __name__ == "__main__":
+    scan_net = scan("192.168.18.1/24")
+    show_result(scan_net)
